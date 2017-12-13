@@ -85,16 +85,31 @@ class BuildResult:
 
 
 class BuildSource:
-    def __init__(self, path: Optional[str], module: Optional[str],
-            text: Optional[str]) -> None:
-        self.path = path
+    def __init__(self, paths: Optional[Union[str, List[str]]], module: Optional[str],
+                 text: Optional[str], type: Optional['ModuleType'] = None) -> None:
+
+        if isinstance(paths, list):
+            self.paths = paths
+        elif paths is None:
+            self.paths = []
+        else:
+            self.paths = [paths]
+
         self.module = module or '__main__'
         self.text = text
+        self.type = type
+
+    @property
+    def path(self) -> Optional[str]:
+        if self.paths and self.type != ModuleType.namespace:
+            return self.paths[0]
+        return None
 
     def __repr__(self) -> str:
-        return '<BuildSource path=%r module=%r has_text=%s>' % (self.path,
-                                                                self.module,
-                                                                self.text is not None)
+        return '<BuildSource path=%r module=%r type=%s has_text=%s>' % (self.path,
+                                                                        self.module,
+                                                                        self.type,
+                                                                        self.text is not None)
 
 
 class BuildSourceSet:
@@ -634,7 +649,7 @@ class BuildManager:
 
         return res
 
-    def find_module(self, id: str) -> Optional[str]:
+    def find_module(self, id: str) -> Optional[BuildSource]:
         return self.module_discovery.find_module(id)
 
     def is_module(self, id: str) -> bool:
@@ -743,6 +758,9 @@ def remove_cwd_prefix_from_path(p: str, namespaces_allowed: bool) -> str:
     return p
 
 
+# Cache find_module: (id, lib_path) -> result.
+find_module_cache = {}  # type: Dict[Tuple[str, Tuple[str, ...]], Optional[BuildSource]]
+
 # Cache some repeated work within distinct find_module calls: finding which
 # elements of lib_path have even the subdirectory they'd need for the module
 # to exist.  This is shared among different module ids when they differ only
@@ -754,7 +772,7 @@ find_module_dir_cache = {}  # type: Dict[Tuple[str, Tuple[str, ...]], List[str]]
 # of os.stat() calls is quickly more expensive than caching the
 # os.listdir() outcome, and the advantage of the latter is that it
 # gives us the case-correct filename on Windows and Mac.
-find_module_listdir_cache = {}  # type: Dict[str, Optional[List[str]]]
+find_module_listdir_cache = {}  # type: Dict[str, Set[str]]
 
 # Cache for is_file()
 find_module_is_file_cache = {}  # type: Dict[str, bool]
@@ -764,13 +782,14 @@ find_module_isdir_cache = {}  # type: Dict[Tuple[str, str], bool]
 
 
 def find_module_clear_caches() -> None:
+    find_module_cache.clear()
     find_module_dir_cache.clear()
     find_module_listdir_cache.clear()
     find_module_is_file_cache.clear()
     find_module_isdir_cache.clear()
 
 
-def list_dir(path: str) -> Optional[List[str]]:
+def list_dir(path: str) -> Set[str]:
     """Return a cached directory listing.
 
     Returns None if the path doesn't exist or isn't a directory.
@@ -778,9 +797,9 @@ def list_dir(path: str) -> Optional[List[str]]:
     res = find_module_listdir_cache.get(path)
     if res is None:
         try:
-            res = os.listdir(path)
+            res = set(os.listdir(path))
         except OSError:
-            res = None
+            res = set()
         find_module_listdir_cache[path] = res
     return res
 
@@ -799,7 +818,7 @@ def is_file(path: str) -> bool:
             res = False
         else:
             names = list_dir(head)
-            res = names is not None and tail in names and os.path.isfile(path)
+            res = tail in names and os.path.isfile(path)
         find_module_is_file_cache[path] = res
     return res
 
@@ -810,93 +829,18 @@ class ModuleType(enum.Enum):
     namespace = 'namespace'
 
 
-class ImportContext:
-    """
-    Describes module import context
-
-    Do we already discovered implementation?
-    What kind of module we discovered?
-    """
-    def __init__(self) -> None:
-        self.has_py = False  # type: bool
-        self.type = None  # type: Optional[ModuleType]
-        # Paths can contain only one ".py" path, but multiple stubs
-        self.paths = []  # type: List[str]
-
-    def maybe_add_path(self, path: str, type: ModuleType) -> None:
-        """
-        Add path to import context.
-        Modifies self.paths in case if arguments satisfy import context state
-        """
-        assert path.endswith((os.path.sep,) + tuple(PYTHON_EXTENSIONS))
-
-        if self.type is not None and self.type != type:
-            return None
-
-        # We can add at most one module implementation to paths
-        # But module can have multiple stubs
-        py_path = path.endswith('.py')
-        if self.has_py and py_path:
-            return None
-
-        if type == ModuleType.namespace:
-            ok = self._verify_namespace(path)
-        else:
-            ok = self._verify_module(path)
-
-        if not ok:
-            return None
-
-        if py_path:
-            self.has_py = True
-
-        self.type = type
-        self.paths.append(path)
-
-    def _verify_module(self, path: str) -> bool:
-        # At this point we already know that that it's valid python path
-        # We only need to check file existence
-        if not is_file(path):
-            return False
-
-        return True
-
-    def _verify_namespace(self, path: str) -> bool:
-        if os.path.isdir(path):
-            files = set(list_dir(path) or [])  # type: Set[str]
-            if not ('__init__.py' in files or '__init__.pyi' in files):
-                return True
-
-        return False
-
-
-def is_pkg_path(path: str) -> bool:
-    return path.endswith(('__init__.py', '__init__.pyi'))
-
-
-def is_module_path(path: str) -> bool:
-    return not is_pkg_path(path) and path.endswith(('.py', '.pyi'))
-
-
-def is_namespace_path(path: str) -> bool:
-    return path.endswith(os.path.sep)
-
-
 class ModuleDiscovery:
     def __init__(self,
                  lib_path: Iterable[str],
                  namespaces_allowed: bool = False) -> None:
-
         self.lib_path = tuple(os.path.normpath(p) for p in lib_path)  # type: Tuple[str, ...]
         self.namespaces_allowed = namespaces_allowed
-        self._find_module_cache = {}  # type: Dict[str, List[str]]
 
-    def find_module(self, id: str) -> Optional[str]:
-        paths = self._find_module(id)
-        if paths:
-            return paths[0]
-        else:
-            return None
+    def find_module(self, id: str) -> Optional[BuildSource]:
+        key = (id, self.lib_path)
+        if key not in find_module_cache:
+            find_module_cache[key] = self._find_module(id)
+        return find_module_cache[key]
 
     def find_modules_recursive(self, module: str) -> List[BuildSource]:
         """
@@ -911,27 +855,32 @@ class ModuleDiscovery:
                 result.append(src)
         return result
 
+    def _iter_module_dir_paths(self, source: Optional[BuildSource]) -> Iterator[str]:
+        if not (source and source.paths):
+            return
+
+        if source.type == ModuleType.package:
+            if source.path:
+                yield dirname(source.path)
+        elif source.type == ModuleType.namespace:
+            yield from source.paths
+
     def _find_modules_recursive(self, module: str) -> List[BuildSource]:
-        module_paths = self._find_module(module)
+        src = self.find_module(module)
 
-        srcs = []  # type: List[BuildSource]
-        for path in module_paths:
-            if is_module_path(path) or is_pkg_path(path):
-                srcs.append(BuildSource(path, module, None))
+        if not src:
+            return []
 
-            if is_pkg_path(path):
-                path = dirname(path)
-                for submodule in self._find_submodules(module, path):
-                    srcs += self._find_modules_recursive(submodule)
-            elif is_namespace_path(path):
-                for submodule in self._find_submodules(module, path):
-                    srcs += self._find_modules_recursive(submodule)
+        srcs = [src]  # type: List[BuildSource]
+        for path in self._iter_module_dir_paths(src):
+            for submodule in self._find_submodules(module, path):
+                srcs += self._find_modules_recursive(submodule)
 
         return srcs
 
     def _find_submodules(self, module: str, path: str) -> Iterator[str]:
-        for item in list_dir(path) or []:
-            if item == '__init__.py' or item == '__init__.pyi':
+        for item in list_dir(path):
+            if item.startswith(('__', '.')):
                 continue
 
             if item.endswith(tuple(PYTHON_EXTENSIONS)):
@@ -939,53 +888,46 @@ class ModuleDiscovery:
 
             yield module + '.' + item
 
-    def _collect_paths(self, paths: List[str], last_comp: str) -> List[str]:
-        """
-        Collect all available module paths
-        """
+    def _find_module(self, id: str) -> Optional[BuildSource]:
+        components = id.split('.')
+
+        if len(components) > 1:
+            parent_id = '.'.join(components[:-1])
+            parent = self.find_module(parent_id)
+            if not parent:
+                return None
+            search_paths = list(self._iter_module_dir_paths(parent))
+        else:
+            search_paths = list(self.lib_path)
+
+        leaf_module_name = components[-1]
         sepinit = '__init__'
-        ctx = ImportContext()
 
         # Detect modules in following order: package, module, namespace.
         # First hit determines module type, consistency of paths to given type
         # ensured in ImportContext
-        for path_item in paths:
-            if is_module_path(path_item):
-                continue
-
-            if is_pkg_path(path_item):
-                path_item = dirname(path_item)
+        for path in search_paths:
+            for ext in PYTHON_EXTENSIONS:
+                candidate_path = os.path.join(path, leaf_module_name, sepinit + ext)
+                if is_file(candidate_path):
+                    return BuildSource(candidate_path, id, None, type=ModuleType.package)
 
             for ext in PYTHON_EXTENSIONS:
-                path = os.path.join(path_item, last_comp, sepinit + ext)
-                ctx.maybe_add_path(path, ModuleType.package)
+                candidate_path = os.path.join(path, leaf_module_name + ext)
+                if is_file(candidate_path):
+                    return BuildSource(candidate_path, id, None, type=ModuleType.module)
 
-            for ext in PYTHON_EXTENSIONS:
-                path = os.path.join(path_item, last_comp + ext)
-                ctx.maybe_add_path(path, ModuleType.module)
+        if self.namespaces_allowed:
+            namespace_paths = []
+            for path in search_paths:
+                candidate_path = os.path.join(path, leaf_module_name)
+                if os.path.isdir(candidate_path):
+                    namespace_paths.append(candidate_path)
 
-        if self.namespaces_allowed and not ctx.paths:
-            for path_item in paths:
-                if is_pkg_path(path_item):
-                    path_item = dirname(path_item)
+            if namespace_paths:
+                return BuildSource(namespace_paths, id, None, type=ModuleType.namespace)
 
-                path = os.path.join(path_item, last_comp)
-                ctx.maybe_add_path(path + os.sep, ModuleType.namespace)
-
-        return ctx.paths
-
-    def _find_module(self, id: str) -> List[str]:
-        if id not in self._find_module_cache:
-            components = id.split('.')
-            parent_paths = list(self.lib_path)
-
-            if len(components) > 1:
-                parent_id = '.'.join(components[:-1])
-                parent_paths = self._find_module(parent_id)
-
-            last_comp = components[-1]
-            self._find_module_cache[id] = self._collect_paths(parent_paths, last_comp)
-        return self._find_module_cache[id]
+        return None
 
 
 def read_with_python_encoding(path: str, pyversion: Tuple[int, int]) -> Tuple[str, str]:
@@ -1617,36 +1559,36 @@ class State:
                 # difference and just assume 'builtins' everywhere,
                 # which simplifies code.
                 file_id = '__builtin__'
-            path = manager.find_module(file_id)
-            if path:
-                if not is_namespace_path(path):
-                    # For non-stubs, look at options.follow_imports:
-                    # - normal (default) -> fully analyze
-                    # - silent -> analyze but silence errors
-                    # - skip -> don't analyze, make the type Any
-                    follow_imports = self.options.follow_imports
-                    if (follow_imports != 'normal'
-                            and not root_source  # Honor top-level modules
-                            and path.endswith('.py')  # Stubs are always normal
-                            and id != 'builtins'):  # Builtins is always normal
-                        if follow_imports == 'silent':
-                            # Still import it, but silence non-blocker errors.
-                            manager.log("Silencing %s (%s)" % (path, id))
-                            self.ignore_all = True
-                        else:
-                            # In 'error' mode, produce special error messages.
-                            manager.log("Skipping %s (%s)" % (path, id))
-                            if follow_imports == 'error':
-                                if ancestor_for:
-                                    self.skipping_ancestor(id, path, ancestor_for)
-                                else:
-                                    self.skipping_module(id, path)
-                            path = None
-                            manager.missing_modules.add(id)
-                            raise ModuleNotFound
-                else:
-                    source = ''
-                    self.source_hash = ''
+            src = manager.find_module(file_id)
+            if src and src.type == ModuleType.namespace:
+                source = ''
+                self.source_hash = ''
+            elif src and src.path:
+                path = src.path
+                # For non-stubs, look at options.follow_imports:
+                # - normal (default) -> fully analyze
+                # - silent -> analyze but silence errors
+                # - skip -> don't analyze, make the type Any
+                follow_imports = self.options.follow_imports
+                if (follow_imports != 'normal'
+                        and not root_source  # Honor top-level modules
+                        and path.endswith('.py')  # Stubs are always normal
+                        and id != 'builtins'):  # Builtins is always normal
+                    if follow_imports == 'silent':
+                        # Still import it, but silence non-blocker errors.
+                        manager.log("Silencing %s (%s)" % (path, id))
+                        self.ignore_all = True
+                    else:
+                        # In 'error' mode, produce special error messages.
+                        manager.log("Skipping %s (%s)" % (path, id))
+                        if follow_imports == 'error':
+                            if ancestor_for:
+                                self.skipping_ancestor(id, path, ancestor_for)
+                            else:
+                                self.skipping_module(id, path)
+                        path = None
+                        manager.missing_modules.add(id)
+                        raise ModuleNotFound
             else:
                 # Could not find a module.  Typically the reason is a
                 # misspelled module name, missing stub, module not in
